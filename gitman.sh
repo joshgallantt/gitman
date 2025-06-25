@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Gitman - Git/SSH Env Setup Tool
+# Copyright (c) 2025 Josh Gallant
+# Licensed under the MIT License
+
+set -euo pipefail
+
+trap 'echo -e "\n\033[1;34m[INFO]\033[0m Gitman exited."' EXIT
+
+SSH_DIR="$HOME/.ssh"
+SSH_CONFIG="$SSH_DIR/config"
+GITCONFIG_MAIN="$HOME/.gitconfig"
+CODE_DIR="$HOME/code"
+
+# === Helpers ===
+info()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
+
+pause_for_return() {
+  echo
+  read -rp "Press Enter to return to the menu..." _
+}
+
+confirm() {
+  read -rp "$1 [y/N]: " response
+  [[ "$response" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+append_if_missing() {
+  local file="$1" content="$2"
+  grep -qxF "$content" "$file" 2>/dev/null || echo "$content" >> "$file"
+}
+
+sanitize_env_name() {
+  echo "$1" | sed 's/[^a-zA-Z0-9_-]//g'
+}
+
+# === Resets ===
+reset_ssh_config() {
+  info "Resetting SSH configuration..."
+  ssh-add -D 2>/dev/null || info "No SSH keys in agent"
+  rm -f "$SSH_DIR"/id_ed25519_* "$SSH_CONFIG"
+  info "SSH keys and config removed (if present)."
+}
+
+reset_git_config() {
+  info "Resetting Git configuration..."
+  [[ -f "$GITCONFIG_MAIN" ]] && rm -f "$GITCONFIG_MAIN" && info "Removed $GITCONFIG_MAIN"
+  find "$HOME" -maxdepth 1 -name ".gitconfig-*" -exec rm -f {} \; -exec echo "Removed {}" \;
+}
+
+# === Combined List + Verify ===
+list_and_verify_environments() {
+  echo
+  info "Listing and verifying all configured environments..."
+
+  local found=0
+
+  for cfg in "$HOME"/.gitconfig-*; do
+    [[ -f "$cfg" ]] || continue
+    local id="${cfg##*.gitconfig-}"
+    local env_path="$CODE_DIR/$id"
+    local host="github.com-$id"
+    local tmp_repo="$env_path/.temp_envctl_verification"
+
+    found=1
+    echo
+    info "🔍 Environment: $id"
+    echo "  Directory: $env_path"   # <-- Added line to show the path
+
+    if [[ -d "$env_path" ]]; then
+      mkdir -p "$tmp_repo"
+      git init -q "$tmp_repo"
+
+      pushd "$tmp_repo" >/dev/null
+      local name=$(git config user.name || echo "<unset>")
+      local email=$(git config user.email || echo "<unset>")
+      popd >/dev/null
+
+      echo "  Git Config:"
+      echo "    name:  $name"
+      echo "    email: $email"
+
+      rm -rf "$tmp_repo"
+    else
+      warn "  Git directory '$env_path' does not exist."
+    fi
+
+    echo "  SSH Test:"
+    ssh_output=$(ssh -T "git@$host" 2>&1 || true)
+    if echo "$ssh_output" | grep -q "successfully authenticated"; then
+      echo "    ✅ SSH authentication succeeded for '$host'"
+    else
+      echo "    ❌ SSH auth failed for '$host'"
+      echo "       $ssh_output" | sed 's/^/       /'
+    fi
+
+    echo
+  done
+
+  [[ $found -eq 0 ]] && warn "No environments found."
+
+  pause_for_return
+}
+
+# === Add Environment ===
+add_environment() {
+  read -rp "Environment name (e.g., work, personal, pepsi): " raw_id
+  local id
+  id=$(sanitize_env_name "$raw_id")
+
+  if [[ -z "$id" ]]; then
+    error "Environment name is invalid or empty."
+    pause_for_return
+    return
+  fi
+
+  read -rp "Git user name: " git_name
+  read -rp "Git email: " git_email
+
+  local key_path="$SSH_DIR/id_ed25519_$id"
+  local pubkey_path="$key_path.pub"
+  local host="github.com-$id"
+  local gitconfig_path="$HOME/.gitconfig-$id"
+  local env_path="$CODE_DIR/$id"
+
+  mkdir -p "$SSH_DIR" "$env_path"
+  chmod 700 "$SSH_DIR"
+  touch "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+
+  if [[ -f "$key_path" || -f "$gitconfig_path" ]]; then
+    warn "An environment named '$id' already exists."
+    if ! confirm "Do you want to overwrite it?"; then
+      info "Add environment cancelled."
+      pause_for_return
+      return
+    fi
+    rm -f "$key_path" "$pubkey_path" "$gitconfig_path"
+    sed -i '' "/gitdir:$env_path/d" "$GITCONFIG_MAIN" || true
+  fi
+
+  # === SSH Key
+  ssh-keygen -t ed25519 -C "$git_email" -f "$key_path" -N "" || {
+    error "SSH keygen failed"
+    pause_for_return
+    return
+  }
+
+  chmod 600 "$key_path" "$pubkey_path"
+  ssh-add --apple-use-keychain "$key_path" || warn "Failed to add key to agent"
+
+  # === SSH Config
+  cat >> "$SSH_CONFIG" <<EOF
+
+Host $host
+  HostName github.com
+  User git
+  IdentityFile $key_path
+  UseKeychain yes
+  AddKeysToAgent yes
+EOF
+
+  # === Git Config
+  append_if_missing "$GITCONFIG_MAIN" "[includeIf \"gitdir:$env_path/\"]"
+  append_if_missing "$GITCONFIG_MAIN" "  path = $gitconfig_path"
+
+  cat > "$gitconfig_path" <<EOF
+[user]
+  name = $git_name
+  email = $git_email
+EOF
+
+  info "Environment '$id' configured."
+  echo
+
+  if command -v pbcopy &>/dev/null; then
+    cat "$pubkey_path" | pbcopy
+    info "Public key copied to clipboard."
+  else
+    info "Public key for '$id':"
+    cat "$pubkey_path"
+  fi
+
+  info "Opening GitHub SSH settings page..."
+  open "https://github.com/settings/keys" || warn "Couldn't open browser automatically."
+
+  echo
+  info "Please add the SSH public key to your GitHub account."
+  until confirm "Have you added the key to GitHub?"; do
+    info "Waiting for confirmation..."
+  done
+
+  info "Testing SSH connection to GitHub using host '$host'..."
+  output=$(ssh -T "git@$host" 2>&1 || true)
+  if echo "$output" | grep -q "successfully authenticated"; then
+    info "SSH authentication successful. Environment '$id' is ready!"
+  else
+    warn "SSH authentication failed. Output:"
+    echo "$output"
+  fi
+
+  # === Git config verification
+  info "Verifying Git config using .temp_envctl_verification inside env directory..."
+  local tmp_repo="$env_path/.temp_envctl_verification"
+  mkdir -p "$tmp_repo"
+  git init -q "$tmp_repo"
+
+  pushd "$tmp_repo" >/dev/null
+  local name=$(git config user.name || echo "<unset>")
+  local email=$(git config user.email || echo "<unset>")
+  popd >/dev/null
+
+  rm -rf "$tmp_repo"
+
+  if [[ "$name" == "$git_name" && "$email" == "$git_email" ]]; then
+    info "Git config correctly applied:"
+    echo " - name:  $name"
+    echo " - email: $email"
+  else
+    warn "Git config mismatch:"
+    echo "Expected:"
+    echo " - name:  $git_name"
+    echo " - email: $git_email"
+    echo "Got:"
+    echo " - name:  $name"
+    echo " - email: $email"
+  fi
+
+  pause_for_return
+}
+
+# === Menu UI ===
+main_menu() {
+  clear
+  cat <<EOF
+╔════════════════════════════════╗
+║          Gitman v1.0           ║
+║     a Git/SSH Env Setup Tool   ║
+║       © 2025 Josh Gallant      ║
+╚════════════════════════════════╝
+
+1. Reset SSH Configuration
+2. Reset Git Configuration
+3. Add Environment
+4. List & Verify Environments
+5. Exit
+EOF
+
+  read -rp "Choose an option [1-5]: " choice
+  echo
+  case "$choice" in
+    1) reset_ssh_config; pause_for_return ;;
+    2) reset_git_config; pause_for_return ;;
+    3) add_environment ;;
+    4) list_and_verify_environments ;;
+    5)
+	info "Exiting Gitman. Goodbye!"
+	sleep 0.5
+	exit 0
+      ;;
+    *) echo "Invalid choice."; pause_for_return ;;
+  esac
+}
+
+# === Entry Point ===
+while true; do
+  main_menu
+done
