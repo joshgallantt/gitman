@@ -11,11 +11,10 @@
 
 ## 🛠️ Installation
 
-1.  **Clone or copy the script:**
-
-    ```bash
-	test
-    ```
+```bash
+brew tap joshgallantt/homebrew-tap
+brew install gitman
+```
 
 ## 🧩 How It Works
 
