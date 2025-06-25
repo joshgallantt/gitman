@@ -1,6 +1,11 @@
-# Gitman
+<h1 align="center">Gitman</h1>
+
+<p align="center">
+  <img width="545" alt="Screenshot 2025-06-25 at 18 38 36" src="https://github.com/user-attachments/assets/18df0fbb-27dc-47ba-803e-f1dc78e3ef0b" />
+</p>
 
 **Gitman** is a command-line tool designed for macOS to help you manage multiple Git and SSH environments. It's ideal for keeping your work and personal GitHub identities separate, automating SSH key generation, and handling per-project Git configurations.
+
 
 ## 📦 Features
   * 🔐 Generate dedicated SSH keys for each GitHub environment with Apple Keychain support.
